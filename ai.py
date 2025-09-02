@@ -271,12 +271,12 @@ async def list_models():
             "description": entry["description"],
             "streamable": entry["streamable"],
             "model_id": entry["model"],
-            console_note = {
-            "console_url": "https://youssofai.onrender.com/",
-            "note": "DONATE US TELEGRAM : t.me/youssofxmoussa",
         })
 
-
+    console_note = {
+        "console_url": "https://youssofai.onrender.com/",
+        "note": "DONATE US TELEGRAM : t.me/youssofxmoussa",
+    }
 
     return {"models": result, "console": console_note}
 
