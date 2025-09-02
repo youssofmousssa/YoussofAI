@@ -1,7 +1,8 @@
+"""
 youssof_backend.py
 
 FastAPI backend that exposes a unified, themed API for multiple Groq models and
-external image/video endpoints as requested.
+external image/video endpoints (DarkAI / sii3.moayman.top) as requested.
 
 Features:
 - Endpoints with "Youssof" friendly names:
@@ -10,8 +11,9 @@ Features:
     /youssof/deep_reasoning      -> GPT OSS 120B (long-reasoning)
     /youssof/scout_tool_call     -> Llama 4 Scout (tooling/function-call style)
     /youssof/vision              -> Llama 4 Maverick (image understanding)
-    /youssof/image_gen           -> external image gen API (sii3.moayman.top)
-    /youssof/video_gen           -> external video gen API (image-to-video & text-to-video)
+    /youssof/image_gen           -> external image gen API (sii3.moayman.top / flux-pro)
+    /youssof/video_gen           -> external video gen API (veo3.php — image-to-video & text-to-video)
+    /youssof/edit                -> external image edit API (gpt-img.php)  <-- NEW: YoussofEdit
     /youssof/tts                 -> PlayAI TTS via Groq audio.speech.create
     /youssof/moderate           -> Llama Guard moderation model
     (No STT endpoint per request.)
@@ -22,16 +24,15 @@ Features:
 - Async HTTP calls via httpx for external APIs
 - Clean error handling and typed Pydantic request/response models
 
-Dependencies:
-    pip install fastapi uvicorn httpx aiofiles pydantic groq
+Notes:
+- External DarkAI endpoints used:
+    * Image generation (flux-pro):  https://sii3.moayman.top/api/flux-pro.php
+    * Image-to-video & Text-to-video (veo3): https://sii3.moayman.top/api/veo3.php
+    * Image edit (gpt-img): https://sii3.moayman.top/api/gpt-img.php
 
 Run:
     GROQ_API_KEY="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" \
         uvicorn youssof_backend:app --host 0.0.0.0 --port 8000
-
-Note: This file includes the API key as the default for convenience (per your demo note).
-You should still prefer setting GROQ_API_KEY in env vars for production.
-
 """
 
 import os
@@ -41,21 +42,18 @@ import asyncio
 from pathlib import Path
 from typing import Optional, List, Any, Dict, AsyncGenerator
 
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
-import aiofiles
 
-# Import the Groq client - assumes it's installed in the environment.
-# If not present, pip install groq
+# Try import Groq SDK (if unavailable, error will be raised)
 try:
     from groq import Groq
 except Exception as e:
     raise RuntimeError(
-        "groq SDK not available. Install with `pip install groq` "
-        "(or if you are in a locked environment, adapt this code)."
+        "groq SDK not available. Install with `pip install groq`"
     ) from e
 
 # ---------------------------
@@ -64,7 +62,7 @@ except Exception as e:
 
 DEFAULT_GROQ_KEY = os.environ.get(
     "GROQ_API_KEY",
-    "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",  # user-provided demo key
+    "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",  # demo key (as provided)
 )
 
 GROQ_CLIENT = Groq(api_key=DEFAULT_GROQ_KEY)
@@ -115,10 +113,10 @@ YOUSSOF_MODELS = {
     },
 }
 
-# External image/video endpoints (as provided by the user).
-IMAGE_GEN_BASE = "https://sii3.moayman.top/api/flux-pro.php"
-IMG_TO_VIDEO_BASE = "https://sii3.moayman.top/api/img-to-video.php"
-TEXT_TO_VIDEO_BASE = "https://sii3.moayman.top/api/text-to-video.php"
+# External DarkAI / sii3 endpoints (updated per your docs)
+IMAGE_GEN_BASE = "https://sii3.moayman.top/api/flux-pro.php"  # flux-pro image gen
+VIDEO_BASE = "https://sii3.moayman.top/api/veo3.php"  # unified image->video & text->video
+EDIT_BASE = "https://sii3.moayman.top/api/gpt-img.php"  # image edit / gpt-img
 
 # HTTP client for external requests
 HTTPX_TIMEOUT = 60  # seconds
@@ -159,6 +157,11 @@ class ImageGenRequest(BaseModel):
 class VideoGenRequest(BaseModel):
     prompt: str
     image_url: Optional[str] = None  # for image-to-video
+
+
+class EditRequest(BaseModel):
+    prompt: str
+    image_url: str  # link to source image to edit
 
 
 class TTSRequest(BaseModel):
@@ -214,14 +217,11 @@ async def stream_groq_chat_response(
     """
     Streams Groq chat predictions as bytes (SSE compatible).
     Each chunk will be yielded as a small JSON payload line prefixed by 'data:'.
-    Note: Groq client's streaming interface is used as in your examples (sync iterator).
-    The Groq SDK's streaming may be synchronous; here we adapt it to async by running
-    in a thread. If the SDK supports async iteration, adapt accordingly.
+    Running the Groq streaming generator in a thread to avoid blocking the event loop.
     """
     loop = asyncio.get_running_loop()
 
     def run_and_yield():
-        # Blocking call to Groq streaming generator — runs in thread
         try:
             completion = GROQ_CLIENT.chat.completions.create(
                 model=model_id,
@@ -233,34 +233,38 @@ async def stream_groq_chat_response(
                 stop=None,
             )
         except Exception as e:
-            # send an error data chunk
             return [{"error": str(e)}]
 
-        # The SDK yields chunks; we will collect and return a list of JSON-serializable chunks
         collected = []
         try:
             for chunk in completion:
-                # Each chunk may have structure: chunk.choices[0].delta.content
+                # Try to extract token content robustly
                 try:
-                    token = chunk.choices[0].delta.get("content") if hasattr(chunk.choices[0].delta, "get") else getattr(chunk.choices[0].delta, "content", None)
-                except Exception:
-                    # fallback generic string
+                    delta = getattr(chunk.choices[0], "delta", None)
                     token = None
-                # If token is None, try other fields
+                    if isinstance(delta, dict):
+                        token = delta.get("content")
+                    else:
+                        token = getattr(delta, "content", None)
+                except Exception:
+                    token = None
+
                 if token is None:
-                    token = getattr(chunk.choices[0].delta, "content", None) or getattr(chunk.choices[0], "content", None) or str(chunk)
+                    token = getattr(chunk.choices[0], "message", None)
+                    if token:
+                        token = getattr(token, "content", None)
+                if token is None:
+                    token = str(chunk)
                 collected.append({"chunk": token})
         except Exception as e:
             collected.append({"error": str(e)})
         return collected
 
-    # Run sync generator in threadpool
     chunks = await loop.run_in_executor(None, run_and_yield)
-    # Yield SSE-style text/event-stream data lines
     for obj in chunks:
         payload = json.dumps(obj, ensure_ascii=False)
         yield f"data: {payload}\n\n".encode("utf-8")
-        await asyncio.sleep(0.01)  # gentle pacing
+        await asyncio.sleep(0.01)
 
 
 # ---------------------------
@@ -272,14 +276,14 @@ async def list_models():
     """Return friendly model names and metadata, excluding hidden models."""
     result = []
     for key, entry in YOUSSOF_MODELS.items():
-        if entry.get("hidden"):  # Skip models marked as hidden
+        if entry.get("hidden"):
             continue
         result.append({
             "model_key": key,
             "display_name": entry["display_name"],
             "description": entry["description"],
             "streamable": entry["streamable"],
-            "model_id": entry["display_name"],  # Use display_name as model_id
+            "model_id": entry["display_name"],  # user requested model_id = display_name
         })
 
     console_note = {
@@ -293,17 +297,13 @@ async def list_models():
 @app.post("/youssof/chat")
 async def youssof_chat(req: ChatRequest):
     """
-    Streamed chat endpoint for Youssof Chat (Llama 3.3 70B by default).
-    Accepts messages array. Returns Server-Sent Events stream when stream=True.
+    Streamed chat endpoint for Youssof Chat (Llama 3.3 70B).
     """
     entry = get_model_entry(req.model_key or "youssof_chat")
     model_id = entry["model"]
     max_tokens = req.max_completion_tokens or entry.get("max_tokens")
 
-    # Convert Pydantic messages to plain dict structure expected by Groq SDK
-    messages = []
-    for m in req.messages:
-        messages.append({"role": m.role, "content": m.content})
+    messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
     if req.stream:
         generator = stream_groq_chat_response(
@@ -315,7 +315,6 @@ async def youssof_chat(req: ChatRequest):
         )
         return StreamingResponse(generator, media_type="text/event-stream")
     else:
-        # Non-streaming path: call Groq synchronously (in thread) and return final content
         loop = asyncio.get_event_loop()
 
         def blocking_call():
@@ -328,13 +327,10 @@ async def youssof_chat(req: ChatRequest):
                 stream=False,
                 stop=None,
             )
-            # attempt to extract text
             try:
-                # structure differs by SDK; attempt common fields
-                text = completion.choices[0].message.content
+                return completion.choices[0].message.content
             except Exception:
-                text = str(completion)
-            return text
+                return str(completion)
 
         content = await loop.run_in_executor(None, blocking_call)
         return {"model": entry["display_name"], "response": content}
@@ -344,12 +340,9 @@ async def youssof_chat(req: ChatRequest):
 async def youssof_deep_reasoning(req: SimpleTextRequest):
     """
     Entrypoint for the deep reasoning model (GPT OSS 120B).
-    Streams when requested.
     """
     entry = get_model_entry("youssof_deep_reasoning")
-    messages = [
-        {"role": "user", "content": req.text}
-    ]
+    messages = [{"role": "user", "content": req.text}]
     if req.stream:
         generator = stream_groq_chat_response(
             model_id=entry["model"],
@@ -359,7 +352,6 @@ async def youssof_deep_reasoning(req: SimpleTextRequest):
         )
         return StreamingResponse(generator, media_type="text/event-stream")
     else:
-        # sync call in thread
         loop = asyncio.get_event_loop()
 
         def blocking():
@@ -374,6 +366,7 @@ async def youssof_deep_reasoning(req: SimpleTextRequest):
                 return comp.choices[0].message.content
             except Exception:
                 return str(comp)
+
         result = await loop.run_in_executor(None, blocking)
         return {"model": entry["display_name"], "response": result}
 
@@ -381,8 +374,7 @@ async def youssof_deep_reasoning(req: SimpleTextRequest):
 @app.post("/youssof/scout_tool_call")
 async def youssof_scout(req: ChatRequest):
     """
-    Tool-calling / function-use endpoint (Scout). Accepts message structures that may
-    include images or specialized content in message.content.
+    Tool-calling / function-use endpoint (Scout).
     """
     entry = get_model_entry("youssof_scout")
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
@@ -397,7 +389,6 @@ async def youssof_scout(req: ChatRequest):
             media_type="text/event-stream",
         )
     else:
-        # blocking sync call
         loop = asyncio.get_event_loop()
 
         def blocking():
@@ -412,6 +403,7 @@ async def youssof_scout(req: ChatRequest):
                 return comp.choices[0].message.content
             except Exception:
                 return str(comp)
+
         result = await loop.run_in_executor(None, blocking)
         return {"model": entry["display_name"], "response": result}
 
@@ -419,16 +411,9 @@ async def youssof_scout(req: ChatRequest):
 @app.post("/youssof/vision")
 async def youssof_vision(req: ChatRequest):
     """
-    Vision-capable endpoint (Maverick). Expects one message where content may be a list
-    including an 'image_url' entry as in your example.
-    Example content:
-    [
-        {"type": "text", "text": "Who is he?"},
-        {"type": "image_url", "image_url": {"url": "https://..."}}
-    ]
+    Vision-capable endpoint (Maverick). Pass content list containing image_url as shown in examples.
     """
     entry = get_model_entry("youssof_maverick")
-    # Prepare messages: pass through content as-is (the model expects list content for vision)
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     if req.stream:
         return StreamingResponse(
@@ -455,6 +440,7 @@ async def youssof_vision(req: ChatRequest):
                 return comp.choices[0].message.content
             except Exception:
                 return str(comp)
+
         result = await loop.run_in_executor(None, blocking)
         return {"model": entry["display_name"], "response": result}
 
@@ -462,11 +448,10 @@ async def youssof_vision(req: ChatRequest):
 @app.post("/youssof/image_gen")
 async def youssof_image_gen(req: ImageGenRequest):
     """
-    Calls the external image-generation API (sii3.moayman.top).
-    Returns the JSON that the service returns (with image URLs).
+    Calls DarkAI flux-pro image-generation API.
+    Example POST form: text=<prompt>
     """
     params = {"text": req.prompt}
-    # if n > 1, the remote API might not support it; just call once per requested image
     try:
         r = await httpx_client.post(IMAGE_GEN_BASE, data=params)
         r.raise_for_status()
@@ -478,23 +463,37 @@ async def youssof_image_gen(req: ImageGenRequest):
 @app.post("/youssof/video_gen")
 async def youssof_video_gen(req: VideoGenRequest):
     """
-    Two modes:
-    - If image_url provided -> image-to-video API
-    - Otherwise -> text-to-video API
+    Unified video endpoint.
+    - If image_url provided -> image-to-video via VIDEO_BASE with params text & link
+    - Otherwise -> text-to-video via VIDEO_BASE with params text
     """
     if req.image_url:
         params = {"text": req.prompt, "link": req.image_url}
-        target = IMG_TO_VIDEO_BASE
     else:
         params = {"text": req.prompt}
-        target = TEXT_TO_VIDEO_BASE
 
     try:
-        r = await httpx_client.post(target, data=params)
+        r = await httpx_client.post(VIDEO_BASE, data=params)
         r.raise_for_status()
+        # the DarkAI / veo3 endpoint returns JSON with "url" (mp4) or similar
         return JSONResponse(content=r.json())
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Video service error: {str(e)}")
+
+
+@app.post("/youssof/edit", tags=["youssof-edit"])
+async def youssof_edit(req: EditRequest):
+    """
+    NEW: YoussofEdit - edit an existing image via DarkAI gpt-img.php
+    Example POST form: text=<prompt>&link=<image_url>
+    """
+    params = {"text": req.prompt, "link": req.image_url}
+    try:
+        r = await httpx_client.post(EDIT_BASE, data=params)
+        r.raise_for_status()
+        return JSONResponse(content=r.json())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Edit service error: {str(e)}")
 
 
 @app.post("/youssof/tts")
@@ -503,11 +502,9 @@ async def youssof_tts(req: TTSRequest):
     Uses Groq audio.speech.create to generate TTS audio and returns a WAV file.
     """
     entry = get_model_entry(req.model_key or "youssof_tts")
-    # Create a temporary file to stream to
     tmp_dir = tempfile.gettempdir()
     filename = Path(tmp_dir) / f"youssof_tts_{int(asyncio.get_event_loop().time() * 1000)}.wav"
 
-    # Blocking call to Groq audio API (stream_to_file)
     def blocking_tts():
         try:
             response = GROQ_CLIENT.audio.speech.create(
@@ -516,7 +513,7 @@ async def youssof_tts(req: TTSRequest):
                 response_format=req.response_format,
                 input=req.input,
             )
-            # response is assumed to have stream_to_file method like your sample
+            # stream_to_file is used per your earlier samples
             response.stream_to_file(str(filename))
             return str(filename)
         except Exception as e:
@@ -528,7 +525,6 @@ async def youssof_tts(req: TTSRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Return file as response
     return FileResponse(path=filepath, media_type="audio/wav", filename=Path(filepath).name)
 
 
@@ -536,12 +532,9 @@ async def youssof_tts(req: TTSRequest):
 async def youssof_moderate(req: ModerateRequest):
     """
     Run a moderation check via Llama Guard.
-    Returns the model's moderation classification.
     """
     entry = get_model_entry("youssof_guard")
-    messages = [
-        {"role": "user", "content": req.text}
-    ]
+    messages = [{"role": "user", "content": req.text}]
 
     loop = asyncio.get_event_loop()
 
@@ -553,12 +546,10 @@ async def youssof_moderate(req: ModerateRequest):
             max_completion_tokens=entry["max_tokens"],
             stream=False,
         )
-        # Attempt to extract content from structured response
         try:
-            out = comp.choices[0].message.content
+            return comp.choices[0].message.content
         except Exception:
-            out = str(comp)
-        return out
+            return str(comp)
 
     result = await loop.run_in_executor(None, blocking)
     return {"model": entry["display_name"], "moderation_result": result}
