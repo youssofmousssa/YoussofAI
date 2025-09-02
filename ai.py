@@ -74,14 +74,14 @@ YOUSSOF_MODELS = {
     "youssof_chat": {
         "display_name": "Youssof Chat",
         "model": "llama-3.3-70b-versatile",
-        "description": "Default general chat + multilingual assistant (Llama 3.3 70B).",
+        "description": "Default general chat + multilingual assistant (Youssof chat v1).",
         "streamable": True,
         "max_tokens": 1024,
     },
     "youssof_deep_reasoning": {
         "display_name": "Youssof Deep Reasoning",
         "model": "openai/gpt-oss-120b",
-        "description": "Heavy-duty deep reasoning model (GPT OSS 120B).",
+        "description": "Heavy-duty deep reasoning model (Youssof Reasoning v1).",
         "streamable": True,
         "max_tokens": 8192,
     },
@@ -109,7 +109,7 @@ YOUSSOF_MODELS = {
     "youssof_tts": {
         "display_name": "Youssof TTS (PlayAI)",
         "model": "playai-tts",
-        "description": "Text to speech via PlayAI TTS.",
+        "description": "Text to speech via YoussofAI TTS v1.",
         "streamable": False,
         "max_tokens": None,
     },
@@ -270,7 +270,7 @@ async def list_models():
             "display_name": entry["display_name"],
             "description": entry["description"],
             "streamable": entry["streamable"],
-            "model_id": entry["model"],
+            "model_id": entry["display_name"],  # Use display_name as model_id
         })
 
     console_note = {
