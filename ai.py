@@ -1,4 +1,3 @@
-"""
 youssof_backend.py
 
 FastAPI backend that exposes a unified, themed API for multiple Groq models and
@@ -44,6 +43,7 @@ from typing import Optional, List, Any, Dict, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import aiofiles
@@ -181,6 +181,15 @@ app = FastAPI(
     description="One-stop backend to access Groq models and external image/video APIs. "
                 "Models are presented with friendly Youssof branding.",
     version="1.0.0",
+)
+
+# Enable CORS (allow all origins). In production, restrict allow_origins to your domain(s).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
