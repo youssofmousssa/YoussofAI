@@ -260,9 +260,11 @@ async def stream_groq_chat_response(
 
 @app.get("/youssof/models")
 async def list_models():
-    """Return friendly model names and metadata"""
+    """Return friendly model names and metadata, excluding hidden models."""
     result = []
     for key, entry in YOUSSOF_MODELS.items():
+        if entry.get("hidden"):  # Skip models marked as hidden
+            continue
         result.append({
             "model_key": key,
             "display_name": entry["display_name"],
@@ -270,12 +272,9 @@ async def list_models():
             "streamable": entry["streamable"],
             "model_id": entry["model"],
         })
-    # Also include reminder of Groq Console / provided API key (user asked for this)
-    console_note = {
-        "console_url": "https://console.groq.com",
-        "note": "Demo API key was provided and will be used by default unless GROQ_API_KEY env var is set.",
-        # do NOT recommend embedding keys in public repos; this is a demo convenience.
-    }
+
+
+
     return {"models": result, "console": console_note}
 
 
